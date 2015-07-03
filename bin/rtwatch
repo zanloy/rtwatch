@@ -1,0 +1,87 @@
+#!/usr/bin/env ruby
+
+# Ruby Stdlib
+require 'fileutils'
+require 'net/ftp'
+# Ruby Gems
+require 'colorize'
+require 'facets'
+require 'hashie'
+require 'rtorrent_xmlrpc'
+require 'to_name'
+
+debug = false
+# Load the config file
+config_file = nil
+%W[rwatch.conf #{Dir.home}/.config/rwatch.conf #{Dir.home}/.rwatch.conf /etc/rwatch.conf].each do |f|
+  if File.exists?(f)
+    config_file = f
+    break
+  end
+end
+raise 'No config file found.' if config_file.nil?
+config = Hashie::Mash.load(config_file)
+
+def download_file(ftp, file, destination_dir)
+  destination = File.join(destination_dir, File.basename(file))
+  puts "<< #{file}".colorize(:blue)
+  puts ">> #{destination}".colorize(:green)
+  ftp.getbinaryfile(file, destination, 1024)
+  ftp.delete(file)
+end
+
+def download_dir(ftp, remote_dir, local_dir, remote_dir_prefix = '')
+  directories = []
+  files = []
+  links = ftp.ls("-1 #{remote_dir}")
+  links.map! { |x| File.join(remote_dir, x) }
+  links.each { |link|
+    dir = ftp.ls("-d #{link}")[0][0] == 'd' ? true : false
+    if dir
+      directories << link
+    else
+      files << link
+    end
+  }
+  directories.each { |directory|
+    download_dir(ftp, directory, File.join(local_dir, directory), File.join(remote_dir_prefix, directory))
+  }
+  # Make destination directory
+  destination_dir = File.join(local_dir, remote_dir.lchomp(remote_dir_prefix))
+  FileUtils.mkdir_p(destination_dir)
+  files.each { |file|
+    download_file(ftp, file, destination_dir)
+  }
+  ftp.rmdir(remote_dir)
+end
+
+server = RTorrent::XMLRPC.new_from_hash(config.rtorrent)
+server.connect
+server.fetch_torrents
+
+continue = true
+while continue do
+  torrent = server.completed.with_label(:done).first
+
+  Net::FTP.open(config.rtorrent.site, config.rtorrent.username, config.rtorrent.password) do |ftp|
+    # Stop the torrent
+    puts "Stopping #{torrent.name}...".colorize(:red)
+    server.stop torrent.hash
+    # Remove the label in case another thread scans during our download.
+    server.set_label torrent.id, 'downloading'
+    line = ftp.ls("-d #{torrent.base_path}")[0]
+    if line[0] == 'd' # Is a directory
+      download_dir ftp, torrent.base_path, config.download.dir, config.rtorrent.remote_dir_prefix
+    else # Is a file
+      download_file ftp, torrent.base_path, config.download.dir
+    end
+    unless torrent.tied_to_file.empty?
+      begin
+        ftp.delete(torrent.tied_to_file)
+      rescue Net::FTPPermError => e
+      end
+    end
+    server.stop torrent.id
+  end #Net::FTP
+
+end
